@@ -17,9 +17,13 @@
 //      pixels inside the clipped triangle actually get painted, so 468
 //      points x ~800 triangles reconstructs the whole warped face.
 //   4. The reassembled warped face is masked with a blurred (feathered)
-//      alpha shape following the source face's outer contour, then
-//      composited over the live video frame so the edges blend instead of
-//      looking like a hard cutout.
+//      alpha shape following the live face's outer contour, with the inner
+//      mouth opening (teeth/tongue cavity) punched out of that mask — so
+//      the source photo's mouth interior is never drawn, and the live
+//      webcam's real teeth/tongue always show through instead. The masked
+//      result is brightness-matched to the live scene, then composited over
+//      the live video frame so the edges blend instead of looking like a
+//      hard cutout.
 //
 // Nothing here touches the network except to load the MediaPipe model/wasm,
 // and nothing is written to disk/localStorage/sessionStorage — the uploaded
@@ -42,6 +46,16 @@ const FACE_OVAL = [
   10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379,
   378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127,
   162, 21, 54, 103, 67, 109,
+];
+
+// The inner lip contour — the boundary of the mouth *opening* (teeth/tongue
+// cavity), as opposed to the outer lip contour (the lips themselves). We cut
+// this region out of the swap mask so the real, live mouth interior always
+// shows through instead of the source photo's (mouth-shape-mismatched)
+// teeth/tongue.
+const INNER_LIPS = [
+  78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 415, 310, 311, 312, 13,
+  82, 81, 80, 191,
 ];
 
 // ---------------------------------------------------------------------------
@@ -76,7 +90,15 @@ const uploadedFace = {
   height: 0,
   landmarks: null, // array of {x,y} in *pixel* coords of uploadedFace.canvas
   triangles: null, // array of [i,j,k] index triples into landmarks
+  avgLum: null, // average skin luminance, sampled once, for brightness matching
 };
+
+// Cached live-frame brightness gain, recomputed every LUM_SAMPLE_INTERVAL
+// frames (see drawFaceSwap) — lighting doesn't change frame to frame, so
+// there's no need to pay for a getImageData readback on every single frame.
+const LUM_SAMPLE_INTERVAL = 6;
+let cachedBrightnessGain = 1;
+let frameCounter = 0;
 
 // Offscreen scratch canvases reused every frame (avoid per-frame allocation)
 const warpCanvas = document.createElement("canvas");
@@ -320,6 +342,10 @@ faceUpload.addEventListener("change", async (e) => {
     uploadedFace.landmarks = pixelLandmarks;
     uploadedFace.triangles = delaunayTriangulate(pixelLandmarks);
 
+    const avgColor = averageColorInPolygon(canvas, pixelLandmarks, FACE_OVAL);
+    uploadedFace.avgLum = avgColor ? luminance(avgColor) : null;
+    cachedBrightnessGain = 1; // reset until the next live-frame sample
+
     facePreview.src = canvas.toDataURL("image/png");
     facePreview.hidden = false;
 
@@ -466,6 +492,133 @@ function renderLoop() {
 }
 
 /**
+ * Trace a closed polygon path through `landmarks` at the given `indices`.
+ * `scale`, if given, inflates the polygon outward from its own centroid by
+ * that factor first. This matters for a subsequent blurred fill: blurring a
+ * shape softens its edges by *shrinking* its effective peak-alpha interior
+ * (a gaussian blur can't add energy, only spread it), so a thin polygon
+ * blurred at hard edges never reaches full opacity anywhere. Inflating the
+ * shape before blurring keeps the blur's softening confined to the outside
+ * of the original boundary, so the true interior still hits full opacity —
+ * this is what guarantees the inner-mouth cutout actually reaches "fully
+ * transparent" at its center instead of leaving a faint ghost of the
+ * source face's mouth visible.
+ */
+function tracePolygon(ctx, landmarks, indices, scale) {
+  const pts = indices.map((idx) => landmarks[idx]).filter(Boolean);
+  let points = pts;
+  if (scale && scale !== 1 && pts.length > 0) {
+    let cx = 0, cy = 0;
+    for (const p of pts) { cx += p.x; cy += p.y; }
+    cx /= pts.length; cy /= pts.length;
+    points = pts.map((p) => ({
+      x: cx + (p.x - cx) * scale,
+      y: cy + (p.y - cy) * scale,
+    }));
+  }
+
+  ctx.beginPath();
+  points.forEach((p, n) => {
+    if (n === 0) ctx.moveTo(p.x, p.y);
+    else ctx.lineTo(p.x, p.y);
+  });
+  ctx.closePath();
+}
+
+/**
+ * Average RGB color within a landmark polygon (e.g. the face oval), sampled
+ * on a strided grid and restricted to points actually inside the polygon
+ * (not just its bounding box) so background pixels don't skew the result.
+ * Used once, at upload time, on the source photo — cheap enough to afford
+ * exact polygon testing since it never runs per-frame.
+ */
+function averageColorInPolygon(canvas, landmarks, indices) {
+  const pts = indices.map((idx) => landmarks[idx]).filter(Boolean);
+  if (pts.length === 0) return null;
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+  minX = Math.max(0, Math.floor(minX));
+  minY = Math.max(0, Math.floor(minY));
+  maxX = Math.min(canvas.width, Math.ceil(maxX));
+  maxY = Math.min(canvas.height, Math.ceil(maxY));
+  const bw = maxX - minX, bh = maxY - minY;
+  if (bw <= 0 || bh <= 0) return null;
+
+  const ctx = canvas.getContext("2d");
+  const data = ctx.getImageData(minX, minY, bw, bh).data;
+
+  const path = new Path2D();
+  pts.forEach((p, n) => {
+    const x = p.x - minX, y = p.y - minY;
+    if (n === 0) path.moveTo(x, y);
+    else path.lineTo(x, y);
+  });
+  path.closePath();
+
+  let r = 0, g = 0, b = 0, count = 0;
+  const stride = 3;
+  for (let y = 0; y < bh; y += stride) {
+    for (let x = 0; x < bw; x += stride) {
+      if (!ctx.isPointInPath(path, x, y)) continue;
+      const i = (y * bw + x) * 4;
+      r += data[i];
+      g += data[i + 1];
+      b += data[i + 2];
+      count++;
+    }
+  }
+  if (count === 0) return null;
+  return { r: r / count, g: g / count, b: b / count };
+}
+
+/**
+ * Cheap approximate average color of the live face's bounding box, read
+ * straight from the already-drawn video frame. Skips exact polygon testing
+ * (unlike averageColorInPolygon) since this runs on a hot path — a rough
+ * average including a bit of background/hair is precise enough for
+ * brightness matching.
+ */
+function averageColorInBoundingBox(ctx, landmarks, indices, w, h) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const idx of indices) {
+    const p = landmarks[idx];
+    if (!p) continue;
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+  minX = Math.max(0, Math.floor(minX));
+  minY = Math.max(0, Math.floor(minY));
+  maxX = Math.min(w, Math.ceil(maxX));
+  maxY = Math.min(h, Math.ceil(maxY));
+  const bw = maxX - minX, bh = maxY - minY;
+  if (bw <= 0 || bh <= 0) return null;
+
+  const data = ctx.getImageData(minX, minY, bw, bh).data;
+  let r = 0, g = 0, b = 0, count = 0;
+  const stride = 4;
+  for (let i = 0; i < data.length; i += 4 * stride) {
+    r += data[i];
+    g += data[i + 1];
+    b += data[i + 2];
+    count++;
+  }
+  if (count === 0) return null;
+  return { r: r / count, g: g / count, b: b / count };
+}
+
+function luminance(color) {
+  return 0.299 * color.r + 0.587 * color.g + 0.114 * color.b;
+}
+
+/**
  * Warps the uploaded face onto the live landmark positions and blends it
  * over the already-drawn video frame in outputCanvas.
  */
@@ -480,19 +633,28 @@ function drawFaceSwap(liveLandmarks, w, h) {
     uploadedFace.triangles
   );
 
-  // --- Build a feathered alpha mask following the live face's outer contour ---
+  // --- Build the swap mask: feathered face oval, MINUS the inner mouth ---
+  //
+  // The inner-lip polygon marks the mouth *opening* (teeth/tongue cavity).
+  // We deliberately do not warp the source face's mouth interior onto the
+  // live feed — a photo's static teeth/tongue look wrong the instant the
+  // live mouth opens differently. Instead we punch a feathered hole in the
+  // mask there so the real, live mouth interior always shows through, while
+  // the swapped face's own lips still cover the lip skin right up to that
+  // hole (so the lip line itself looks continuous, not double-outlined).
   maskCtx.clearRect(0, 0, w, h);
+
   maskCtx.filter = "blur(6px)";
   maskCtx.fillStyle = "#fff";
-  maskCtx.beginPath();
-  FACE_OVAL.forEach((idx, n) => {
-    const p = liveLandmarks[idx];
-    if (!p) return;
-    if (n === 0) maskCtx.moveTo(p.x, p.y);
-    else maskCtx.lineTo(p.x, p.y);
-  });
-  maskCtx.closePath();
+  tracePolygon(maskCtx, liveLandmarks, FACE_OVAL);
   maskCtx.fill();
+
+  maskCtx.globalCompositeOperation = "destination-out";
+  maskCtx.filter = "blur(2.5px)";
+  maskCtx.fillStyle = "#fff";
+  tracePolygon(maskCtx, liveLandmarks, INNER_LIPS, 1.7);
+  maskCtx.fill();
+  maskCtx.globalCompositeOperation = "source-over";
   maskCtx.filter = "none";
 
   // Apply the mask to the warped face (keep only pixels inside the feathered shape)
@@ -501,6 +663,24 @@ function drawFaceSwap(liveLandmarks, w, h) {
   warpCtx.drawImage(maskCanvas, 0, 0);
   warpCtx.restore();
 
+  // --- Match the warped face's brightness to the live scene's lighting ---
+  //
+  // A source photo shot in different lighting than the current webcam frame
+  // otherwise looks like a visibly pasted-on patch. We only correct overall
+  // brightness (not full per-channel color transfer) — it's the dominant
+  // mismatch and is cheap enough to recompute live.
+  frameCounter++;
+  if (frameCounter % LUM_SAMPLE_INTERVAL === 0 && uploadedFace.avgLum) {
+    const liveColor = averageColorInBoundingBox(outCtx, liveLandmarks, FACE_OVAL, w, h);
+    if (liveColor) {
+      const ratio = luminance(liveColor) / uploadedFace.avgLum;
+      cachedBrightnessGain = Math.min(1.6, Math.max(0.6, ratio));
+    }
+  }
+
   // Composite the masked, warped face over the live video frame.
+  outCtx.save();
+  outCtx.filter = `brightness(${cachedBrightnessGain})`;
   outCtx.drawImage(warpCanvas, 0, 0);
+  outCtx.restore();
 }
