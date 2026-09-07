@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Live Face Swap</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Live Face Swap</h1>
+    <p class="subtitle">Everything runs locally in your browser. Nothing is uploaded, saved, or sent anywhere.</p>
+  </header>
+
+  <main>
+    <div class="controls">
+      <button id="startBtn" class="primary">▶ Start Camera</button>
+      <button id="stopBtn" disabled>■ Stop Camera</button>
+
+      <label class="upload-btn" for="faceUpload">
+        ⬆ Upload Face
+        <input type="file" id="faceUpload" accept="image/*" hidden />
+      </label>
+
+      <label class="res-select">
+        Quality:
+        <select id="resSelect">
+          <option value="320x240">Low (fast)</option>
+          <option value="480x360" selected>Medium</option>
+          <option value="640x480">High (slower)</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="status-row">
+      <span id="statusText">Idle. Click "Start Camera" to begin.</span>
+      <span id="fpsText"></span>
+    </div>
+
+    <div class="stage">
+      <canvas id="outputCanvas"></canvas>
+      <img id="facePreview" alt="Uploaded face preview" hidden />
+    </div>
+  </main>
+
+  <!-- Hidden elements used purely as in-memory processing sources; never displayed, never persisted -->
+  <video id="webcamVideo" autoplay playsinline muted hidden></video>
+
+  <footer>
+    <p>Face tracking powered by MediaPipe Face Landmarker (loaded from CDN at runtime). No images or video ever leave your device.</p>
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
